@@ -61,7 +61,7 @@ def put_text_with_fringe(img, text, origin, color=(0, 255, 0), scale=1.0, thickn
     cv2.putText(img, text, (origin[0], origin[1] + h + baseline), font, scale, color, max(1, thickness//2))
     return img
 
-def nvds_to_bboxes(batch_meta):
+def nvds_to_bboxes(batch_meta, min_confidence=0.5):
     """Convert DeepStream metadata to our bbox format"""
     results = []
     l_frame = batch_meta.frame_meta_list
@@ -72,6 +72,10 @@ def nvds_to_bboxes(batch_meta):
             while l_obj is not None:
                 try:
                     obj_meta = pyds.NvDsObjectMeta.cast(l_obj.data)
+                    # Skip low confidence detections
+                    if obj_meta.confidence < min_confidence:
+                        l_obj = l_obj.next
+                        continue
                     # Extract bounding box coordinates
                     rect_params = obj_meta.rect_params
                     top = int(rect_params.top)
@@ -84,6 +88,11 @@ def nvds_to_bboxes(batch_meta):
                     # Get class info
                     class_id = obj_meta.class_id
                     confidence = obj_meta.confidence
+
+                    # Filter out likely false detections (tiny boxes in the corner)
+                    if width < 10 or height < 10:
+                        l_obj = l_obj.next
+                        continue
                     
                     # Add to results
                     results.append({
@@ -276,9 +285,10 @@ class SimpleDeepStreamPipeline:
         self.source_bin.connect("pad-added", self.on_pad_added)
         print("Pad-added signal connected.")
 
-        # Set up bus for pipeline messages
+        # Set up bus for pipeline messages with segment done handler
         self.bus = self.pipeline.get_bus()
         self.bus.add_signal_watch()
+        self.bus.connect("message::segment-done", self.on_segment_done)
         self.bus.connect("message", self.on_bus_message)
         print("Bus message handler connected.")
 
@@ -347,7 +357,7 @@ class SimpleDeepStreamPipeline:
             return Gst.PadProbeReturn.OK
             
         # Extract bounding boxes
-        bboxes = nvds_to_bboxes(batch_meta)
+        bboxes = nvds_to_bboxes(batch_meta, min_confidence=0.5)
         
         # Store the bounding boxes for later use
         with self.bbox_lock:
@@ -355,37 +365,40 @@ class SimpleDeepStreamPipeline:
             
         return Gst.PadProbeReturn.OK
 
+    def on_segment_done(self, bus, message):
+        """Handle segment done message to loop the video"""
+        print("Segment done - Looping video")
+        flags = Gst.SeekFlags.SEGMENT | Gst.SeekFlags.FLUSH  # Add FLUSH flag
+        ret = self.pipeline.seek(
+            1.0,                            # rate
+            Gst.Format.TIME,                # format
+            flags,                          # updated flags
+            Gst.SeekType.SET, 0,            # start type and value
+            Gst.SeekType.NONE, 0            # stop type and value
+        )
+        if not ret:
+            print("Failed to seek pipeline for looping in on_segment_done")
+        else:
+            print("Seek successful in on_segment_done")
+        return True
+
+
     def on_bus_message(self, bus, message):
         t = message.type
         if t == Gst.MessageType.EOS:
             print("End-of-stream reached - Looping video")
-            # First set state to PAUSED
-            self.pipeline.set_state(Gst.State.PAUSED)
-            
-            # Perform seek operation
+            flags = Gst.SeekFlags.SEGMENT | Gst.SeekFlags.FLUSH  # Add FLUSH flag
             ret = self.pipeline.seek(
-                1.0,                                    # rate (1.0 = normal speed)
-                Gst.Format.TIME,                        # format
-                Gst.SeekFlags.FLUSH |                   # flush pipeline
-                Gst.SeekFlags.SEGMENT |                 # segment mode
-                Gst.SeekFlags.ACCURATE,                 # accurate seeking
-                Gst.SeekType.SET, 0,                    # start position
-                Gst.SeekType.NONE, Gst.CLOCK_TIME_NONE  # stop position (none = play till end)
+                1.0,                            # rate
+                Gst.Format.TIME,                # format
+                flags,                          # updated flags
+                Gst.SeekType.SET, 0,           # start type
+                Gst.SeekType.NONE, 0           # stop type
             )
-            
             if not ret:
-                print("Failed to seek pipeline")
-                # Try alternative seek method
-                ret = self.source_bin.seek_simple(
-                    Gst.Format.TIME,
-                    Gst.SeekFlags.FLUSH | Gst.SeekFlags.KEY_UNIT,
-                    0
-                )
-                if not ret:
-                    print("Failed to seek source_bin")
-            
-            # Set state back to PLAYING
-            self.pipeline.set_state(Gst.State.PLAYING)
+                print("Failed to seek pipeline for looping on EOS")
+            else:
+                print("Seek successful on EOS")
         elif t == Gst.MessageType.ERROR:
             err, debug = message.parse_error()
             print(f"Error: {err}, {debug}")
@@ -504,6 +517,7 @@ class SimpleDeepStreamPipeline:
             except Exception as e:
                 print(f"Error in display thread: {e}")
 
+    
     def start(self):
         # Start processing threads
         self.process_thread = threading.Thread(target=self.process_frames_thread, daemon=True)
@@ -514,6 +528,21 @@ class SimpleDeepStreamPipeline:
         
         # Set pipeline to PLAYING state
         self.pipeline.set_state(Gst.State.PLAYING)
+        
+        # Wait for state change
+        self.pipeline.get_state(Gst.CLOCK_TIME_NONE)
+        
+        # Initial seek to enable segment mode
+        ret = self.pipeline.seek(
+            1.0,                            # rate
+            Gst.Format.TIME,                # format
+            Gst.SeekFlags.SEGMENT,          # flags
+            Gst.SeekType.SET, 0,           # start type and value
+            Gst.SeekType.NONE, 0           # stop type and value
+        )
+        if not ret:
+            print("Failed initial seek")
+        
         print("Pipeline and processing threads started.")
 
     def stop(self):
