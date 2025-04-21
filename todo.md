@@ -1,0 +1,2 @@
+- DeepStream can't make engine files anymore because something wrong with deepstream, opencv or cuda -> installed different versions and shit
+- You should try to build your model to INT8 precision
