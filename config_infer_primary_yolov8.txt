@@ -4,7 +4,7 @@ net-scale-factor=0.0039215697906911373
 model-color-format=0
 #onnx-file=./models/yolov8s.onnx
 model-engine-file=./models/yolov8s_int8.engine
-int8-calib-file=./calib.table
+int8-calib-file=./cache.txt
 labelfile-path=./labels.txt
 batch-size=1
 # Set to 1 for TensorRT int8 precision (if calibrated)
